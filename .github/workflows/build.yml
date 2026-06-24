@@ -1,0 +1,108 @@
+name: Build All AppImages
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: chromium
+            script: ./build-chromium.sh
+            pkg: chromium
+            version_file: last_chromium_version.txt
+          - target: ayugram
+            script: ./build-ayugram.sh
+            pkg: ayugram-desktop-git
+            version_file: last_ayugram_version.txt
+          - target: prism
+            script: ./build-prism.sh
+            pkg: prismlauncher-git
+            version_file: last_prism_version.txt
+
+    container:
+      image: archlinux:latest
+      options: --privileged
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      GIT_DISCOVERY_ACROSS_FILESYSTEM: 1
+
+    steps:
+      - name: Initialize Arch Linux & Install Git
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Sy --noconfirm git curl awk
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set safe directory & permissions
+        run: |
+          chown -R root:root "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup Chaotic-AUR
+        run: |
+          curl -fL -o chaotic-keyring.pkg.tar.zst https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst
+          curl -fL -o chaotic-mirrorlist.pkg.tar.zst https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst
+          pacman -U --noconfirm chaotic-keyring.pkg.tar.zst chaotic-mirrorlist.pkg.tar.zst
+          rm chaotic-keyring.pkg.tar.zst chaotic-mirrorlist.pkg.tar.zst
+          echo -e "\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist" >> /etc/pacman.conf
+          pacman -Sy --noconfirm
+
+      - name: Get Last Built Version
+        id: last_build
+        run: echo "version=$(cat ${{ matrix.version_file }} || echo '0.0.0')" >> $GITHUB_OUTPUT
+
+      - name: Get Latest Version
+        id: get_version
+        run: |
+          LATEST=$(pacman -Si ${{ matrix.pkg }} | grep 'Version' | awk '{print $3}' | cut -d '-' -f 1)
+          echo "full_version=$LATEST" >> $GITHUB_OUTPUT
+
+      - name: Build AppImage
+        id: build
+        if: steps.get_version.outputs.full_version != steps.last_build.outputs.version
+        run: |
+          chmod +x ${{ matrix.script }}
+          ${{ matrix.script }}
+
+      - name: Create Release
+        if: steps.build.outputs.appimage_name
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pacman -S --noconfirm github-cli
+          TAG="${{ matrix.target }}-${{ steps.get_version.outputs.full_version }}"
+          PAYLOAD="${{ steps.build.outputs.appimage_name }}"
+          gh release delete "$TAG" --cleanup-tag -y 2>/dev/null || true
+          gh release create "$TAG" --title "${{ matrix.target }} $TAG" "$PAYLOAD"
+
+      - name: Commit New Version
+        if: steps.build.outputs.appimage_name
+        run: |
+          git reset --hard
+          git clean -fd
+          echo "${{ steps.get_version.outputs.full_version }}" > ${{ matrix.version_file }}
+          if [[ -n $(git status --porcelain ${{ matrix.version_file }}) ]]; then
+            git add ${{ matrix.version_file }}
+            git commit -m "chore: Update ${{ matrix.target }} to ${{ steps.get_version.outputs.full_version }}"
+            git pull --rebase origin main
+            git push
+          else
+            echo "No changes detected, skipping commit."
+          fi
